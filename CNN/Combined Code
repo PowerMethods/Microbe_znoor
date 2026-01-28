@@ -1,0 +1,281 @@
+#!/usr/bin/env python
+"""
+CNN256 FULL PIPELINE — PHASE 6 → 7 → 8 → ANALYSIS → RF BASELINE
+Author: Zanaib Noor
+"""
+
+# ==============================================================
+# GLOBAL IMPORTS
+# ==============================================================
+import os, glob, argparse, pickle, joblib
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict, Counter
+from datetime import datetime
+
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score,
+    precision_score, recall_score, f1_score,
+    matthews_corrcoef, cohen_kappa_score,
+    roc_auc_score, log_loss, confusion_matrix,
+    classification_report
+)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold
+
+# ==============================================================
+# CONFIG (LOCKED)
+# ==============================================================
+SEG_DIR = "/vol/projects/znoor/cnn_training/3class_exp/segments_256"
+
+PHASE6_OUT = "/vol/projects/znoor/cnn_training/3class_exp_CNNBESTMODEL_Phase6"
+PHASE7_OUT = "/vol/projects/znoor/cnn_training/3class_exp/Phase7_Finetune_Calibration"
+FINAL_OUT  = "/vol/projects/znoor/cnn_training/3class_exp/FINAL_RESULTS"
+
+RF_OUT     = f"{PHASE7_OUT}/RF_BASELINE_final"
+
+NUM_CLASSES = 3
+BATCH_SIZE = 16
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+os.makedirs(PHASE6_OUT, exist_ok=True)
+os.makedirs(PHASE7_OUT, exist_ok=True)
+os.makedirs(FINAL_OUT, exist_ok=True)
+os.makedirs(RF_OUT, exist_ok=True)
+
+# ==============================================================
+# LOGGING
+# ==============================================================
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+# ==============================================================
+# DATASET
+# ==============================================================
+class SegmentDataset(Dataset):
+    def __init__(self, files):
+        self.files = files
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        d = np.load(self.files[idx], allow_pickle=True)
+        x = d["windows"].astype(np.float32).reshape(256, -1)
+        y = int(d["label"].item())
+        pid = os.path.basename(self.files[idx]).split("_seg")[0]
+        return torch.tensor(x), torch.tensor(y), pid
+
+# ==============================================================
+# MODEL
+# ==============================================================
+class CNN256(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv1d(256, 128, 7, padding=3),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(128, 64, 5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+        )
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 2375, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, NUM_CLASSES)
+        )
+
+    def forward(self, x):
+        return self.fc(self.conv(x).flatten(1))
+
+# ==============================================================
+# PAIR UTILITIES
+# ==============================================================
+def pair_split():
+    all_files = sorted(glob.glob(f"{SEG_DIR}/*.npz"))
+    pair_map = defaultdict(list)
+    for f in all_files:
+        pair_map[os.path.basename(f).split("_seg")[0]].append(f)
+
+    pairs = sorted(pair_map)
+    np.random.seed(42)
+    np.random.shuffle(pairs)
+
+    n = int(0.6 * len(pairs))
+    train = [f for p in pairs[:n] for f in pair_map[p]]
+    val   = [f for p in pairs[n:] for f in pair_map[p]]
+
+    return train, val
+
+def pair_stats(votes, probs, true):
+    c = Counter(votes)
+    pred = c.most_common(1)[0][0]
+    agreement = c[pred] / len(votes)
+    p = np.array([c.get(i,0)/len(votes) for i in range(NUM_CLASSES)])
+    entropy = -np.sum(p * np.log(p + 1e-9))
+    mean_conf = np.mean([pr[pred] for pr in probs])
+    return pred, agreement, entropy, mean_conf
+
+# ==============================================================
+# PHASE 6 — FULL TRAINING
+# ==============================================================
+def phase6():
+    log("PHASE 6 — TRAINING")
+    train_files, val_files = pair_split()
+
+    model = CNN256().to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+    labels = [int(np.load(f)["label"]) for f in train_files]
+    cnt = Counter(labels)
+    weights = torch.tensor(
+        [len(labels)/(cnt.get(i,1)*NUM_CLASSES) for i in range(NUM_CLASSES)],
+        device=DEVICE
+    )
+    criterion = nn.CrossEntropyLoss(weight=weights)
+
+    loaders = {
+        "train": DataLoader(SegmentDataset(train_files), BATCH_SIZE, shuffle=True),
+        "val":   DataLoader(SegmentDataset(val_files),   BATCH_SIZE, shuffle=False)
+    }
+
+    for epoch in range(1, 151):
+        log(f"EPOCH {epoch}")
+        for split in ["train", "val"]:
+            model.train() if split=="train" else model.eval()
+            pair_votes, pair_probs, pair_true = defaultdict(list), defaultdict(list), {}
+
+            with torch.set_grad_enabled(split=="train"):
+                for x,y,pid in loaders[split]:
+                    x,y = x.to(DEVICE), y.to(DEVICE)
+                    out = model(x)
+                    probs = torch.softmax(out,1)
+                    if split=="train":
+                        loss = criterion(out,y)
+                        opt.zero_grad(); loss.backward(); opt.step()
+                    for i,p in enumerate(pid):
+                        pair_votes[p].append(probs[i].argmax().item())
+                        pair_probs[p].append(probs[i].detach().cpu().numpy())
+                        pair_true[p]=y[i].item()
+
+        torch.save({"epoch":epoch,"model":model.state_dict()},
+                   f"{PHASE6_OUT}/epoch_{epoch:03d}.pt")
+
+# ==============================================================
+# PHASE 7 — FINETUNE
+# ==============================================================
+def phase7():
+    log("PHASE 7 — FINETUNING")
+    train_files, val_files = pair_split()
+
+    model = CNN256().to(DEVICE)
+    model.load_state_dict(torch.load(f"{PHASE6_OUT}/best_model.pt")["model"])
+    for p in model.conv.parameters(): p.requires_grad=False
+
+    opt = torch.optim.Adam(filter(lambda p:p.requires_grad, model.parameters()), lr=1e-5)
+    criterion = nn.CrossEntropyLoss()
+
+    loaders = {
+        "train": DataLoader(SegmentDataset(train_files), BATCH_SIZE, shuffle=True),
+        "val":   DataLoader(SegmentDataset(val_files),   BATCH_SIZE, shuffle=False)
+    }
+
+    best, best_state = -1, None
+
+    for epoch in range(1,11):
+        log(f"FINETUNE EPOCH {epoch}")
+        for split in loaders:
+            model.train() if split=="train" else model.eval()
+            votes, probs, truth = defaultdict(list), defaultdict(list), {}
+            with torch.set_grad_enabled(split=="train"):
+                for x,y,pid in loaders[split]:
+                    x,y = x.to(DEVICE), y.to(DEVICE)
+                    out = model(x)
+                    p = torch.softmax(out,1)
+                    if split=="train":
+                        loss = criterion(out,y)
+                        opt.zero_grad(); loss.backward(); opt.step()
+                    for i,k in enumerate(pid):
+                        votes[k].append(p[i].argmax().item())
+                        probs[k].append(p[i].detach().cpu().numpy())
+                        truth[k]=y[i].item()
+
+            y_true,y_pred=[],[]
+            for k in votes:
+                pr,_,_,_ = pair_stats(votes[k], probs[k], truth[k])
+                y_true.append(truth[k]); y_pred.append(pr)
+
+            score = f1_score(y_true,y_pred,average="macro")+matthews_corrcoef(y_true,y_pred)
+            if split=="val" and score>best:
+                best=score; best_state=model.state_dict()
+
+    torch.save(best_state,f"{PHASE7_OUT}/cnn256_phase7_finetuned.pt")
+
+# ==============================================================
+# PHASE 8 — FINAL INFERENCE
+# ==============================================================
+def phase8():
+    log("PHASE 8 — FINAL INFERENCE")
+    model = CNN256().to(DEVICE)
+    model.load_state_dict(torch.load(f"{PHASE7_OUT}/cnn256_phase7_finetuned.pt"))
+    model.eval()
+
+    with open(f"{PHASE7_OUT}/temperature.pkl","rb") as f:
+        T = pickle.load(f)
+
+    pair_votes, pair_probs, pair_true = defaultdict(list), defaultdict(list), {}
+
+    for f in glob.glob(f"{SEG_DIR}/*.npz"):
+        d=np.load(f,allow_pickle=True)
+        x=torch.tensor(d["windows"].reshape(256,-1)).unsqueeze(0).to(DEVICE)
+        y=int(d["label"])
+        pid=os.path.basename(f).split("_seg")[0]
+        probs=torch.softmax(model(x)/T,1).cpu().numpy()[0]
+        pair_votes[pid].append(probs.argmax())
+        pair_probs[pid].append(probs)
+        pair_true[pid]=y
+
+    rows=[]
+    for pid in pair_votes:
+        pred,agree,ent,conf=pair_stats(pair_votes[pid],pair_probs[pid],pair_true[pid])
+        rows.append({
+            "pair_id":pid,"true":pair_true[pid],"pred":pred,
+            "agreement":agree,"entropy":ent,"mean_confidence":conf,
+            "confident_prediction":agree>=0.8 and ent<=0.5 and conf>=0.7
+        })
+
+    pd.DataFrame(rows).to_csv(f"{FINAL_OUT}/final_pair_predictions.csv",index=False)
+
+# ==============================================================
+# RF BASELINE
+# ==============================================================
+def rf_baseline():
+    df=pd.read_csv(f"{PHASE7_OUT}/FINAL_ANALYSIS/pair_level_entropy_mi.csv")
+    X=df[["entropy","MI","num_segments"]].values
+    y=df["true"].values
+
+    rf=RandomForestClassifier(
+        n_estimators=500,max_depth=6,min_samples_leaf=5,
+        class_weight="balanced",random_state=42,n_jobs=-1
+    )
+    rf.fit(X,y)
+    joblib.dump(rf,f"{RF_OUT}/rf_phase7_model.joblib")
+
+# ==============================================================
+# MAIN
+# ==============================================================
+if __name__=="__main__":
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--phase",required=True,
+                        choices=["6","7","8","rf"])
+    args=parser.parse_args()
+
+    if args.phase=="6": phase6()
+    elif args.phase=="7": phase7()
+    elif args.phase=="8": phase8()
+    elif args.phase=="rf": rf_baseline()
